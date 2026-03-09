@@ -1,4 +1,3 @@
-
 # Intune Remediation - Update Firefox to Latest Version
 # This script will be deployed via Intune and should run on Powershell 5 in the SYSTEM context
 # If Firefox is installed, update to the latest available version and restart Firefox if it is running
@@ -7,6 +6,16 @@
 # If the upgrade fails, exit 1
 
 $ErrorActionPreference = 'Stop'
+
+function Write-DebugLog {
+	param(
+		[Parameter(Mandatory = $true)]
+		[string]$Message
+	)
+
+	$timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+	Write-Output "DEBUG [$timestamp] $Message"
+}
 
 function Get-FirefoxInfo {
 	$paths = @(
@@ -133,9 +142,17 @@ function Test-WingetUpgradeSuccess {
 }
 
 try {
+	Write-DebugLog "Remediation started."
 	$fx = Get-FirefoxInfo
+	Write-DebugLog "Firefox detection: $([bool]$fx)."
 	if (-not $fx) {
+		Write-DebugLog "Firefox not installed. Exiting with success."
 		exit 0
+	}
+
+	Write-DebugLog "Detected channel: $($fx.Channel)."
+	if ($fx.Path) {
+		Write-DebugLog "Firefox path: $($fx.Path)."
 	}
 
 	$wingetPath = Get-WingetPath
@@ -143,18 +160,24 @@ try {
 		Write-Output "Remediation failed: winget.exe was not found."
 		exit 1
 	}
+	Write-DebugLog "winget path: $wingetPath"
 
 	$packageId = if ($fx.Channel -eq 'ESR') { 'Mozilla.Firefox.ESR' } else { 'Mozilla.Firefox' }
+	Write-DebugLog "Package id: $packageId"
 
 	$wasRunning = $false
 	$procs = Get-Process -Name firefox -ErrorAction SilentlyContinue
 	if ($procs) {
 		$wasRunning = $true
+		Write-DebugLog "Firefox processes found: $($procs.Count). Stopping."
 		$procs | Stop-Process -Force -ErrorAction SilentlyContinue
 		Start-Sleep -Seconds 2
+	} else {
+		Write-DebugLog "No Firefox processes running."
 	}
 
 	$result = Invoke-WingetUpgrade -WingetPath $wingetPath -PackageId $packageId
+	Write-DebugLog "winget exit code: $($result.ExitCode)"
 	if (-not (Test-WingetUpgradeSuccess -Result $result)) {
 		$tail = $result.Output | Select-Object -Last 8
 		Write-Output "Remediation failed: winget exit code $($result.ExitCode)."
@@ -165,9 +188,11 @@ try {
 	}
 
 	if ($wasRunning -and $fx.Path -and (Test-Path -Path $fx.Path)) {
+		Write-DebugLog "Restarting Firefox."
 		Start-Process -FilePath $fx.Path -ErrorAction SilentlyContinue
 	}
 
+	Write-DebugLog "Remediation completed successfully."
 	exit 0
 } catch {
 	Write-Output "Remediation failed: $($_.Exception.Message)"
