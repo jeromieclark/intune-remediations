@@ -14,7 +14,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$minimumSafeVersion = [version]"1.109.3"
+$minimumSafeVersion = [version]"1.110.0"
 
 function Get-InstalledVscodeVersions {
 	$found = @()
