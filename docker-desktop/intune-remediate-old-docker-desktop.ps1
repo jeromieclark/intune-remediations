@@ -6,7 +6,7 @@
 
 $ErrorActionPreference = 'Stop'
 
-$minimumVersion = [version]'4.60.1'
+$minimumVersion = [version]'4.63.0'
 
 function Convert-VersionTextToVersion {
 	param(
