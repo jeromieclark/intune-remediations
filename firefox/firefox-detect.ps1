@@ -6,6 +6,9 @@
 
 $ErrorActionPreference = 'Stop'
 
+$EnableNonStandardDetection = $true
+$MaxNonStandardResults = 20
+
 $DebugEnabled = $true
 if ($DebugEnabled) {
 	$VerbosePreference = 'Continue'
@@ -21,6 +24,171 @@ function Write-DebugLog {
 	if ($DebugEnabled) {
 		Write-Verbose $Message
 	}
+}
+
+function ConvertTo-Version {
+	param(
+		[Parameter(Mandatory = $true)]
+		[AllowEmptyString()]
+		[string]$Value
+	)
+
+	if (-not $Value) {
+		return $null
+	}
+
+	$matches = [regex]::Match($Value, '(\d+\.\d+(?:\.\d+){0,2})')
+	if (-not $matches.Success) {
+		return $null
+	}
+
+	try {
+		return [version]$matches.Groups[1].Value
+	} catch {
+		return $null
+	}
+}
+
+function Test-FirefoxRuntimeHeuristics {
+	param(
+		[Parameter(Mandatory = $true)]
+		[string]$ExePath
+	)
+
+	if (-not (Test-Path -Path $ExePath)) {
+		return $false
+	}
+
+	$dir = Split-Path -Path $ExePath -Parent
+	$markers = @(
+		(Join-Path -Path $dir -ChildPath 'application.ini'),
+		(Join-Path -Path $dir -ChildPath 'omni.ja')
+	)
+
+	$found = 0
+	foreach ($marker in $markers) {
+		if (Test-Path -Path $marker) {
+			$found++
+		}
+	}
+
+	return ($found -ge 1)
+}
+
+function Get-FirefoxCategory {
+	param(
+		[Parameter(Mandatory = $true)]
+		[string]$Path
+	)
+
+	$normalized = $Path.ToLowerInvariant()
+	if ($normalized -match 'ms-playwright|\\\.playwright\\|\\playwright\\') {
+		return 'Playwright'
+	}
+
+	if ($normalized -match '\\resources\\app|\\vendor\\|\\asar') {
+		return 'Embedded'
+	}
+
+	return 'Portable'
+}
+
+function Get-RemediationMode {
+	param(
+		[Parameter(Mandatory = $true)]
+		[string]$Category
+	)
+
+	if ($Category -eq 'Portable') {
+		return 'InPlacePreferred'
+	}
+
+	return 'ReportOnly'
+}
+
+function Get-NonStandardFirefoxInstances {
+	param(
+		[Parameter(Mandatory = $true)]
+		$StandardPaths,
+		[Parameter(Mandatory = $true)]
+		[int]$MaxResults
+	)
+
+	$standardPathSet = @{}
+	foreach ($standardPath in @($StandardPaths)) {
+		if ($standardPath) {
+			$standardPathSet[$standardPath.ToLowerInvariant()] = $true
+		}
+	}
+
+	$candidates = @()
+	$patterns = @(
+		"$Env:ProgramFiles\node_modules\ms-playwright\firefox-*\firefox\firefox.exe",
+		"${Env:ProgramFiles(x86)}\node_modules\ms-playwright\firefox-*\firefox\firefox.exe",
+		"$Env:ProgramData\.playwright\firefox-*\firefox\firefox.exe",
+		"$Env:ProgramFiles\*\resources\app*\*\firefox.exe",
+		"${Env:ProgramFiles(x86)}\*\resources\app*\*\firefox.exe",
+		"$Env:ProgramData\*\*\firefox.exe",
+		"C:\Firefox*\firefox.exe",
+		"C:\Tools\*\firefox.exe",
+		"C:\Apps\*\firefox.exe"
+	)
+
+	foreach ($pattern in $patterns) {
+		try {
+			$items = @(Get-ChildItem -Path $pattern -File -ErrorAction Stop)
+			foreach ($item in $items) {
+				if ($item -and $item.FullName) {
+					$candidates += $item.FullName
+				}
+			}
+		} catch {
+			continue
+		}
+	}
+
+	$results = @()
+	$seen = @{}
+	foreach ($path in ($candidates | Select-Object -Unique)) {
+		if (@($results).Count -ge $MaxResults) {
+			Write-DebugLog "Reached non-standard scan cap ($MaxResults)."
+			break
+		}
+
+		if ($standardPathSet.ContainsKey($path.ToLowerInvariant())) {
+			continue
+		}
+
+		$key = $path.ToLowerInvariant()
+		if ($seen.ContainsKey($key)) {
+			continue
+		}
+		$seen[$key] = $true
+
+		if (-not (Test-FirefoxRuntimeHeuristics -ExePath $path)) {
+			continue
+		}
+
+		$rawVersion = $null
+		try {
+			$rawVersion = (Get-Item -Path $path -ErrorAction Stop).VersionInfo.FileVersion
+		} catch {
+			Write-DebugLog "Unable to read file version for '$path'."
+		}
+
+		$parsedVersion = ConvertTo-Version -Value ([string]$rawVersion)
+		$category = Get-FirefoxCategory -Path $path
+
+		$results += [pscustomobject]@{
+			Path            = $path
+			Version         = $parsedVersion
+			VersionRaw      = $rawVersion
+			Category        = $category
+			RemediationMode = Get-RemediationMode -Category $category
+		}
+	}
+
+	return @($results)
 }
 
 function Get-FirefoxInfo {
@@ -165,27 +333,89 @@ function Get-LatestVersionViaWinget {
 try {
 	Write-DebugLog "Starting Firefox detection."
 	$fx = Get-FirefoxInfo
-	if (-not $fx) {
-		Write-DebugLog "Firefox not installed. Marking compliant."
+	$standardPaths = @(
+		"$Env:ProgramFiles\Mozilla Firefox\firefox.exe",
+		"${Env:ProgramFiles(x86)}\Mozilla Firefox\firefox.exe"
+	) | Where-Object { $_ -and (Test-Path -Path $_) }
+
+	$nonStandard = @()
+	if ($EnableNonStandardDetection) {
+		$nonStandard = Get-NonStandardFirefoxInstances -StandardPaths $standardPaths -MaxResults $MaxNonStandardResults
+		Write-DebugLog "Non-standard Firefox instances discovered: $($nonStandard.Count)."
+	}
+
+	$hasFirefox = [bool]$fx -or ($nonStandard.Count -gt 0)
+	if (-not $hasFirefox) {
+		Write-DebugLog "Firefox not installed in standard or non-standard paths. Marking compliant."
 		exit 0
 	}
 
-	$policiesOK = Test-PolicyKeys
-	$svcOK      = Test-MaintenanceService
-	$taskOK     = Test-BackgroundUpdateTask
+	$policiesOK = $true
+	$svcOK      = $true
+	$taskOK     = $true
+	if ($fx) {
+		$policiesOK = Test-PolicyKeys
+		$svcOK      = Test-MaintenanceService
+		$taskOK     = Test-BackgroundUpdateTask
+	}
 
-	$latest = Get-LatestVersionViaWinget -Channel $fx.Channel
+	$latest = $null
+	$latestRelease = Get-LatestVersionViaWinget -Channel 'Release'
+	if ($fx) {
+		$latest = Get-LatestVersionViaWinget -Channel $fx.Channel
+	}
+
 	if ($latest) {
 		Write-DebugLog "Installed version: $($fx.Version). Latest version: $latest."
-	} else {
+	} elseif ($fx) {
 		Write-DebugLog "Latest version could not be determined via winget."
 	}
 
-	$needsUpgrade = $false
-	if ($latest -and ($fx.Version -lt $latest)) { $needsUpgrade = $true }
-	Write-DebugLog "Upgrade required: $needsUpgrade. Policies OK: $policiesOK. Service OK: $svcOK. Task OK: $taskOK."
+	if ($latestRelease) {
+		Write-DebugLog "Latest release version for non-standard comparison: $latestRelease."
+	} else {
+		Write-DebugLog "Latest release version could not be determined. Non-standard comparisons will be conservative."
+	}
 
-	if ($needsUpgrade -or (-not $policiesOK) -or (-not $svcOK) -or (-not $taskOK)) {
+	$needsUpgrade = $false
+	if ($fx -and $latest -and ($fx.Version -lt $latest)) {
+		$needsUpgrade = $true
+	}
+
+	$nonStandardIssues = @()
+	foreach ($instance in $nonStandard) {
+		$requiresAction = $false
+		$reason = 'Manual review required.'
+
+		if (-not $instance.Version) {
+			$requiresAction = $true
+			$reason = 'Unable to parse version.'
+		} elseif ($latestRelease -and ($instance.Version -lt $latestRelease)) {
+			$requiresAction = $true
+			$reason = "Version $($instance.Version) is behind latest release $latestRelease."
+		} elseif (-not $latestRelease) {
+			$requiresAction = $true
+			$reason = 'Unable to determine current latest release version.'
+		}
+
+		if ($requiresAction) {
+			$nonStandardIssues += [pscustomobject]@{
+				Path            = $instance.Path
+				Version         = $instance.Version
+				Category        = $instance.Category
+				RemediationMode = $instance.RemediationMode
+				Reason          = $reason
+			}
+		}
+	}
+
+	Write-DebugLog "Upgrade required: $needsUpgrade. Policies OK: $policiesOK. Service OK: $svcOK. Task OK: $taskOK. Non-standard issues: $($nonStandardIssues.Count)."
+
+	foreach ($issue in $nonStandardIssues) {
+		Write-Output "NonStandardFinding category=$($issue.Category) mode=$($issue.RemediationMode) version=$($issue.Version) path=$($issue.Path) reason=$($issue.Reason)"
+	}
+
+	if ($needsUpgrade -or (-not $policiesOK) -or (-not $svcOK) -or (-not $taskOK) -or ($nonStandardIssues.Count -gt 0)) {
 		Write-DebugLog "Non-compliant state detected."
 		exit 1
 	}
