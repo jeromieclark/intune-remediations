@@ -270,12 +270,19 @@ function Get-FirefoxInfo {
 }
 
 function Get-WingetPath {
-	$searchRoots = @()
-	if ($env:LOCALAPPDATA) {
-		$searchRoots += (Join-Path -Path $env:LOCALAPPDATA -ChildPath "Microsoft\WindowsApps")
+	# First, try to find winget via Get-Command (handles PATH scenarios)
+	$command = Get-Command winget.exe -ErrorAction SilentlyContinue
+	if ($command) {
+		return $command.Source
 	}
+
+	# Fallback: Search in standard Windows App directories
+	$searchRoots = @()
 	if ($env:ProgramFiles) {
 		$searchRoots += (Join-Path -Path $env:ProgramFiles -ChildPath "WindowsApps")
+	}
+	if ($env:LOCALAPPDATA) {
+		$searchRoots += (Join-Path -Path $env:LOCALAPPDATA -ChildPath "Microsoft\WindowsApps")
 	}
 
 	foreach ($root in $searchRoots) {
