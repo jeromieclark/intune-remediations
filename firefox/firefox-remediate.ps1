@@ -32,13 +32,13 @@ function ConvertTo-Version {
 		return $null
 	}
 
-	$matches = [regex]::Match($Value, '(\d+\.\d+(?:\.\d+){0,2})')
-	if (-not $matches.Success) {
+	$results = [regex]::Match($Value, '(\d+\.\d+(?:\.\d+){0,2})')
+	if (-not $results.Success) {
 		return $null
 	}
 
 	try {
-		return [version]$matches.Groups[1].Value
+		return [version]$results.Groups[1].Value
 	} catch {
 		return $null
 	}
